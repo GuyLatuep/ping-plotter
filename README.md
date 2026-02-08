@@ -35,6 +35,4 @@ Beispiele:
   - Linux (iputils): `ping -c 1 -W 2`
 
 ## Tipps
-- Bei sehr großen IP-Listen kann die Thread-Anzahl steigen; begrenzen Sie ggf. die Liste oder erweitern Sie den Code um ein Thread-Limit.
-- Wenn `ping` lokalisierte Ausgaben liefert, passen Sie bei Bedarf die Zeit-Parsing-Logik an (`time=`/`Zeit=`/`time<1ms` werden aktuell erkannt).
 - Logdatei prüfen, um schnelle Übersicht über nicht erreichbare Ziele zu bekommen.
