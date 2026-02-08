@@ -4,8 +4,7 @@ use std::{
     fs,
     fs::OpenOptions,
     io::Write,
-    path::Path,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -30,6 +29,12 @@ fn parse_time(stdout: &[u8]) -> Option<f64> {
     let text = String::from_utf8_lossy(stdout);
     for part in text.split_whitespace() {
         let lower = part.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("time<").or_else(|| lower.strip_prefix("zeit<")) {
+            let value = rest.trim_end_matches("ms");
+            if let Ok(ms) = value.parse::<f64>() {
+                return Some(ms.min(1.0) / 2.0); // treat <1ms as ~0.5ms
+            }
+        }
         if let Some(rest) = lower.strip_prefix("time=").or_else(|| lower.strip_prefix("zeit=")) {
             let value = rest.trim_end_matches("ms");
             if value.starts_with('<') {
@@ -55,14 +60,21 @@ fn append_log_line(path: &Path, line: &str) {
 
 fn ping_once(ip: &str) -> (bool, Option<f64>) {
     // Use system ping to avoid raw socket requirements; capture output to keep console clean.
-    let mut cmd = Command::new("ping");
-    if cfg!(target_os = "windows") {
-        cmd.args(["-n", "1", "-w", "1900", ip]);
-    } else if cfg!(target_os = "macos") {
-        cmd.args(["-c", "1", "-W", "1900", ip]);
+    let mut cmd = if let Ok(mock) = env::var("PING_PLOTTER_MOCK") {
+        let mut c = Command::new(mock);
+        c.arg(ip);
+        c
     } else {
-        cmd.args(["-c", "1", "-W", "2", ip]); // iputils uses seconds; 2s approximates 1900ms
-    }
+        let mut c = Command::new("ping");
+        if cfg!(target_os = "windows") {
+            c.args(["-n", "1", "-w", "1900", ip]);
+        } else if cfg!(target_os = "macos") {
+            c.args(["-c", "1", "-W", "1900", ip]);
+        } else {
+            c.args(["-c", "1", "-W", "2", ip]); // iputils uses seconds; 2s approximates 1900ms
+        }
+        c
+    };
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
     let timeout = Duration::from_millis(1900);
@@ -288,5 +300,99 @@ fn main() {
     append_log_line(&log_path, &format!("[{}] Final state:", timestamp()));
     for line in &last_display {
         append_log_line(&log_path, line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parses_common_time_formats() {
+        let samples = [
+            ("time=12.34 ms", Some(12.34)),
+            ("Zeit=56ms", Some(56.0)),
+            ("time<1ms", Some(0.5)),
+            ("no time here", None),
+        ];
+        for (input, expected) in samples {
+            let got = parse_time(input.as_bytes());
+            assert_eq!(got, expected, "failed on input {input}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_mock_ping(script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        let unique = format!("mock_ping_{}_{}", std::process::id(), nanos);
+        let path = std::env::temp_dir().join(unique);
+        fs::write(&path, script).expect("write mock ping");
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&path, perm).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn with_mock<F: FnOnce()>(path: &Path, f: F) {
+        let prev = std::env::var("PING_PLOTTER_MOCK").ok();
+        unsafe { std::env::set_var("PING_PLOTTER_MOCK", path) };
+        f();
+        if let Some(val) = prev {
+            unsafe { std::env::set_var("PING_PLOTTER_MOCK", val) };
+        } else {
+            unsafe { std::env::remove_var("PING_PLOTTER_MOCK") };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ping_once_reports_success_and_latency() {
+        let script = "#!/bin/sh\necho '64 bytes from 1.1.1.1: time=7.89 ms'\nexit 0\n";
+        let path = make_mock_ping(script);
+        with_mock(&path, || {
+            let (success, latency) = ping_once("1.1.1.1");
+            assert!(success);
+            assert_eq!(latency, Some(7.89));
+        });
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ping_once_reports_failure() {
+        let script = "#!/bin/sh\nexit 1\n";
+        let path = make_mock_ping(script);
+        with_mock(&path, || {
+            let (success, latency) = ping_once("1.1.1.1");
+            assert!(!success);
+            assert_eq!(latency, None);
+        });
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ping_once_times_out() {
+        let script = "#!/bin/sh\nsleep 3\n";
+        let path = make_mock_ping(script);
+        with_mock(&path, || {
+            let start = Instant::now();
+            let (success, latency) = ping_once("1.1.1.1");
+            let elapsed = start.elapsed();
+            assert!(!success);
+            assert_eq!(latency, None);
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "expected timeout to cut off sleep, got {:?}",
+                elapsed
+            );
+        });
+        let _ = fs::remove_file(path);
     }
 }
