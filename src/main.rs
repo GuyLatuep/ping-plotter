@@ -3,7 +3,7 @@ use std::{
     env,
     fs,
     fs::OpenOptions,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 use chrono::Local;
 use wait_timeout::ChildExt;
 
@@ -56,6 +61,11 @@ fn append_log_line(path: &Path, line: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{line}");
     }
+}
+
+fn clear_screen() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
 }
 
 fn ping_once(ip: &str) -> (bool, Option<f64>) {
@@ -266,7 +276,7 @@ fn main() {
             last_display.clear();
             last_display.extend(lines.iter().cloned());
 
-            print!("\x1B[2J\x1B[H"); // clear screen and reset cursor
+            clear_screen(); // clear screen and reset cursor (cross-platform)
             for line in &lines {
                 println!("{line}");
             }

@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 wait-timeout = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.27"
