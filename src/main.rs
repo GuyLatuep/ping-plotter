@@ -3,21 +3,42 @@ use std::{
     env,
     fs,
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::Local;
+use clap::Parser;
 use crossterm::{
     cursor::MoveTo,
     execute,
     terminal::{Clear, ClearType},
 };
-use chrono::Local;
 use wait_timeout::ChildExt;
+
+const INTERVAL: Duration = Duration::from_secs(2);
+const PING_TIMEOUT_MS: u64 = 1900;
+
+#[derive(Parser, Debug)]
+#[command(name = "ping-plotter")]
+#[command(about = "Ping multiple IPs on a fixed interval and display stats", long_about = None)]
+struct Args {
+    /// Run duration in seconds (omit to run forever)
+    #[arg(short = 'd', long = "duration")]
+    duration: Option<u64>,
+
+    /// Path to the IP list file
+    #[arg(short = 'i', long = "ips")]
+    ip_file: Option<PathBuf>,
+
+    /// Path to the log file
+    #[arg(short = 'l', long = "log")]
+    log_file: Option<PathBuf>,
+}
 
 #[derive(Default, Clone, Copy)]
 struct Stats {
@@ -27,6 +48,35 @@ struct Stats {
     max_ms: Option<f64>,
     sum_ms: f64,
     samples: u64,
+}
+
+impl Stats {
+    fn record(&mut self, success: bool, latency_ms: Option<f64>) {
+        self.total += 1;
+        if success {
+            self.success += 1;
+            if let Some(ms) = latency_ms {
+                self.min_ms = Some(self.min_ms.map_or(ms, |cur| cur.min(ms)));
+                self.max_ms = Some(self.max_ms.map_or(ms, |cur| cur.max(ms)));
+                self.sum_ms += ms;
+                self.samples += 1;
+            }
+        }
+    }
+
+    fn avg_ms(&self) -> Option<f64> {
+        if self.samples > 0 {
+            Some(self.sum_ms / self.samples as f64)
+        } else {
+            None
+        }
+    }
+}
+
+struct PingResult {
+    ip: String,
+    success: bool,
+    latency_ms: Option<f64>,
 }
 
 fn parse_time(stdout: &[u8]) -> Option<f64> {
@@ -57,9 +107,22 @@ fn timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn append_log_line(path: &Path, line: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+fn open_log(path: &Path) -> Option<BufWriter<fs::File>> {
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => Some(BufWriter::new(file)),
+        Err(err) => {
+            eprintln!("Failed to open log file {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+fn append_log_line(writer: &mut Option<BufWriter<fs::File>>, line: &str) {
+    if let Some(w) = writer.as_mut() {
+        if writeln!(w, "{line}").is_err() {
+            eprintln!("Failed to write to log file; disabling further logging");
+            *writer = None;
+        }
     }
 }
 
@@ -77,17 +140,18 @@ fn ping_once(ip: &str) -> (bool, Option<f64>) {
     } else {
         let mut c = Command::new("ping");
         if cfg!(target_os = "windows") {
-            c.args(["-n", "1", "-w", "1900", ip]);
+            c.args(["-n", "1", "-w", &PING_TIMEOUT_MS.to_string(), ip]);
         } else if cfg!(target_os = "macos") {
-            c.args(["-c", "1", "-W", "1900", ip]);
+            c.args(["-c", "1", "-W", &PING_TIMEOUT_MS.to_string(), ip]);
         } else {
-            c.args(["-c", "1", "-W", "2", ip]); // iputils uses seconds; 2s approximates 1900ms
+            let secs = ((PING_TIMEOUT_MS as f64) / 1000.0).ceil().max(1.0) as u64;
+            c.args(["-c", "1", "-W", &secs.to_string(), ip]); // iputils uses seconds
         }
         c
     };
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
-    let timeout = Duration::from_millis(1900);
+    let timeout = Duration::from_millis(PING_TIMEOUT_MS);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return (false, None),
@@ -111,34 +175,91 @@ fn ping_once(ip: &str) -> (bool, Option<f64>) {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+fn default_paths() -> (PathBuf, PathBuf) {
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let default_ip = exe_dir.join("ips.txt");
     let default_log = exe_dir.join("result.txt");
+    (default_ip, default_log)
+}
 
-    let mut ip_file = default_ip.clone();
-    let mut run_for: Option<Duration> = None;
-    let mut log_path: PathBuf = default_log.clone();
+fn align_to_even_second() -> Instant {
+    let now_sys = SystemTime::now();
+    let now_inst = Instant::now();
+    let secs = now_sys
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let next_even_secs = if secs % 2 == 0 { secs + 2 } else { secs + 1 };
+    let even_start_sys = UNIX_EPOCH + Duration::from_secs(next_even_secs);
+    let delay = even_start_sys
+        .duration_since(now_sys)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    let first_tick = now_inst + delay;
+    first_tick
+}
 
-    for arg in args.iter().skip(1) {
-        if run_for.is_none() {
-            if let Ok(secs) = arg.parse::<u64>() {
-                run_for = Some(Duration::from_secs(secs));
-                continue;
-            }
-        }
-        if ip_file == default_ip {
-            ip_file = PathBuf::from(arg);
-            continue;
-        }
-        if log_path == default_log {
-            log_path = PathBuf::from(arg);
-        }
-    }
+fn spawn_workers(
+    ips: &[String],
+    tx: mpsc::Sender<PingResult>,
+    first_tick: Instant,
+    deadline: Option<Instant>,
+) -> Vec<thread::JoinHandle<()>> {
+    ips.iter()
+        .cloned()
+        .map(|ip| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut next_tick = first_tick;
+                loop {
+                    let now = Instant::now();
+                    if let Some(end) = deadline {
+                        if now >= end {
+                            break;
+                        }
+                    }
+                    if now < next_tick {
+                        let sleep_dur = next_tick - now;
+                        if let Some(end) = deadline {
+                            if now + sleep_dur >= end {
+                                thread::sleep(end - now);
+                                break;
+                            }
+                        }
+                        thread::sleep(sleep_dur);
+                    }
+                    if let Some(end) = deadline {
+                        if Instant::now() >= end {
+                            break;
+                        }
+                    }
+                    let (success, latency_ms) = ping_once(&ip);
+                    if tx
+                        .send(PingResult {
+                            ip: ip.clone(),
+                            success,
+                            latency_ms,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    next_tick += INTERVAL;
+                }
+            })
+        })
+        .collect()
+}
+
+fn main() {
+    let args = Args::parse();
+    let (default_ip, default_log) = default_paths();
+
+    let ip_file = args.ip_file.unwrap_or(default_ip.clone());
+    let log_path = args.log_file.unwrap_or(default_log.clone());
+    let run_for = args.duration.map(Duration::from_secs);
 
     if !ip_file.exists() {
         eprintln!(
@@ -164,130 +285,75 @@ fn main() {
         std::process::exit(1);
     }
 
-    let stats: Arc<Mutex<HashMap<String, Stats>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    // Align to the next even second boundary to fire all pings in sync.
-    let now_sys = SystemTime::now();
-    let now_inst = Instant::now();
-    let secs = now_sys
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let next_even_secs = if secs % 2 == 0 { secs + 2 } else { secs + 1 };
-    let even_start_sys = UNIX_EPOCH + Duration::from_secs(next_even_secs);
-    let delay = even_start_sys
-        .duration_since(now_sys)
-        .unwrap_or_else(|_| Duration::from_secs(0));
-    let first_tick = now_inst + delay;
+    let first_tick = align_to_even_second();
     let deadline = run_for.map(|d| first_tick + d);
 
+    let (tx, rx) = mpsc::channel::<PingResult>();
+    let handles = spawn_workers(&ips, tx, first_tick, deadline);
+
+    let mut stats: HashMap<String, Stats> = HashMap::new();
     let mut prev_counts: HashMap<String, (u64, u64)> = HashMap::new();
     let mut last_display: Vec<String> = Vec::new();
-
-    for ip in ips.clone() {
-        let stats_handle = Arc::clone(&stats);
-        let thread_deadline = deadline;
-        thread::spawn(move || {
-            let mut next_tick = first_tick;
-            loop {
-                let now = Instant::now();
-                if let Some(end) = thread_deadline {
-                    if now >= end {
-                        break;
-                    }
-                }
-                if now < next_tick {
-                    let sleep_dur = next_tick - now;
-                    if let Some(end) = thread_deadline {
-                        if now + sleep_dur >= end {
-                            thread::sleep(end - now);
-                            break;
-                        }
-                    }
-                    thread::sleep(sleep_dur);
-                }
-                if let Some(end) = thread_deadline {
-                    if Instant::now() >= end {
-                        break;
-                    }
-                }
-                let (success, latency) = ping_once(&ip);
-                {
-                    let mut map = stats_handle.lock().expect("stats mutex poisoned");
-                    let entry = map.entry(ip.clone()).or_default();
-                    entry.total += 1;
-                    if success {
-                        entry.success += 1;
-                        if let Some(ms) = latency {
-                            entry.min_ms = Some(entry.min_ms.map_or(ms, |cur| cur.min(ms)));
-                            entry.max_ms = Some(entry.max_ms.map_or(ms, |cur| cur.max(ms)));
-                            entry.sum_ms += ms;
-                            entry.samples += 1;
-                        }
-                    }
-                }
-                next_tick += Duration::from_secs(2);
-            }
-        });
-    }
+    let mut log_writer = open_log(&log_path);
 
     let mut next_render = first_tick;
     loop {
-        {
-            let mut lines: Vec<String> = Vec::new();
-            lines.push(format!(
-                "{:<20} {:>16} {:>10} {:>10} {:>10}",
-                "IP",
-                "Erfolg/Gesamt",
-                "min (ms)",
-                "avg (ms)",
-                "max (ms)"
-            ));
-            let mut unreachable: Vec<String> = Vec::new();
-            let map = stats.lock().expect("stats mutex poisoned");
-            for ip in &ips {
-                let stat = map.get(ip).copied().unwrap_or_default();
-                let avg_ms = if stat.samples > 0 {
-                    Some(stat.sum_ms / stat.samples as f64)
-                } else {
-                    None
-                };
-                let fmt = |v: Option<f64>| -> String {
-                    v.map(|n| format!("{:.2}", n)).unwrap_or_else(|| "-".to_string())
-                };
-                let count_line = format!(
-                    "{:<20} {:>16} {:>10} {:>10} {:>10}",
-                    ip,
-                    format!("{}/{}", stat.success, stat.total),
-                    fmt(stat.min_ms),
-                    fmt(avg_ms),
-                    fmt(stat.max_ms),
-                );
-                lines.push(count_line);
-
-                let prev = prev_counts.get(ip).copied().unwrap_or((0, 0));
-                let total_diff = stat.total.saturating_sub(prev.0);
-                let success_diff = stat.success.saturating_sub(prev.1);
-                if total_diff > 0 && success_diff == 0 {
-                    unreachable.push(ip.clone());
-                }
-                prev_counts.insert(ip.clone(), (stat.total, stat.success));
-            }
-            last_display.clear();
-            last_display.extend(lines.iter().cloned());
-
-            clear_screen(); // clear screen and reset cursor (cross-platform)
-            for line in &lines {
-                println!("{line}");
-            }
-
-            if !unreachable.is_empty() {
-                append_log_line(
-                    &log_path,
-                    &format!("[{}] unreachable: {}", timestamp(), unreachable.join(", ")),
-                );
-            }
+        for result in rx.try_iter() {
+            let entry = stats.entry(result.ip).or_default();
+            entry.record(result.success, result.latency_ms);
         }
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "{:<20} {:>16} {:>10} {:>10} {:>10}",
+            "IP",
+            "Erfolg/Gesamt",
+            "min (ms)",
+            "avg (ms)",
+            "max (ms)"
+        ));
+
+        let mut unreachable: Vec<String> = Vec::new();
+        for ip in &ips {
+            let stat = stats.get(ip).copied().unwrap_or_default();
+            let fmt = |v: Option<f64>| -> String {
+                v.map(|n| format!("{:.2}", n))
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let count_line = format!(
+                "{:<20} {:>16} {:>10} {:>10} {:>10}",
+                ip,
+                format!("{}/{}", stat.success, stat.total),
+                fmt(stat.min_ms),
+                fmt(stat.avg_ms()),
+                fmt(stat.max_ms),
+            );
+            lines.push(count_line);
+
+            let prev = prev_counts.get(ip).copied().unwrap_or((0, 0));
+            let total_diff = stat.total.saturating_sub(prev.0);
+            let success_diff = stat.success.saturating_sub(prev.1);
+            if total_diff > 0 && success_diff == 0 {
+                unreachable.push(ip.clone());
+            }
+            prev_counts.insert(ip.clone(), (stat.total, stat.success));
+        }
+
+        last_display.clear();
+        last_display.extend(lines.iter().cloned());
+
+        clear_screen();
+        for line in &lines {
+            println!("{line}");
+        }
+
+        if !unreachable.is_empty() {
+            append_log_line(
+                &mut log_writer,
+                &format!("[{}] unreachable: {}", timestamp(), unreachable.join(", ")),
+            );
+        }
+
         let now = Instant::now();
         if let Some(end) = deadline {
             if now >= end {
@@ -304,12 +370,22 @@ fn main() {
             }
             thread::sleep(sleep_dur);
         }
-        next_render += Duration::from_secs(2);
+        next_render += INTERVAL;
     }
 
-    append_log_line(&log_path, &format!("[{}] Final state:", timestamp()));
+    for result in rx.try_iter() {
+        let entry = stats.entry(result.ip).or_default();
+        entry.record(result.success, result.latency_ms);
+    }
+
+    append_log_line(&mut log_writer, &format!("[{}] Final state:", timestamp()));
     for line in &last_display {
-        append_log_line(&log_path, line);
+        append_log_line(&mut log_writer, line);
+    }
+
+    drop(log_writer);
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 

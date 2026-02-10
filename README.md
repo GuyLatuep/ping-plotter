@@ -3,17 +3,22 @@
 Dieses Programm pingt eine Liste von Zieladressen im 2-Sekunden-Takt, zeigt die Ergebnisse in der Konsole an und schreibt optionale Logeinträge.
 
 ## Start & Parameter
-Argumente sind flexibel: erster numerischer Wert = Laufzeit (Sekunden), erster nicht-numerischer Wert = IP-Datei, nächster Wert = Log-Datei.
+Das Tool nutzt jetzt benannte Flags.
 
 Beispiele:
 - `ping-plotter`  
   Nutzt Standardpfade (`ips.txt`, `result.txt` neben der Binary), läuft unendlich.
-- `ping-plotter 120`  
+- `ping-plotter --duration 120`  
   120 Sekunden Laufzeit, Standardpfade.
-- `ping-plotter /pfad/ips.txt /pfad/result.txt`  
+- `ping-plotter --ips /pfad/ips.txt --log /pfad/result.txt`  
   Eigene Dateien, unendliche Laufzeit.
-- `ping-plotter /pfad/ips.txt 300 /pfad/result.txt`  
+- `ping-plotter --ips /pfad/ips.txt --duration 300 --log /pfad/result.txt`  
   Eigene Dateien, 300 Sekunden Laufzeit.
+
+Flags:
+- `-d, --duration <sekunden>`: Laufzeit in Sekunden (optional, sonst unendlich).
+- `-i, --ips <pfad>`: Pfad zur IP-Liste (optional).
+- `-l, --log <pfad>`: Pfad zur Logdatei (optional).
 
 ## Dateien & Pfade
 - **IP-Liste**: Standard `ips.txt` im Ordner der Binary. Eine IP pro Zeile, leere Zeilen werden ignoriert.
